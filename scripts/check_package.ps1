@@ -1,3 +1,5 @@
+param([string]$ApplicationPath)
+
 $ErrorActionPreference = 'Stop'
 if (-not ('ShiguangWindowProbe' -as [type])) {
     Add-Type @'
@@ -28,7 +30,7 @@ public static class ShiguangWindowProbe {
 '@
 }
 $projectDir = Split-Path -Parent $PSScriptRoot
-$applicationPath = Join-Path $projectDir 'dist\Shiguang\Shiguang.exe'
+if (-not $ApplicationPath) { $ApplicationPath = Join-Path $projectDir 'dist\Shiguang\Shiguang.exe' }
 $applicationProcess = Start-Process -FilePath $applicationPath -WorkingDirectory $env:TEMP -WindowStyle Hidden -PassThru
 try {
     [void]$applicationProcess.WaitForInputIdle(20000)

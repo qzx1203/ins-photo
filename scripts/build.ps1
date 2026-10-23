@@ -18,5 +18,30 @@ try {
     $env:PATH = $originalBuildPath
 }
 Copy-Item -LiteralPath (Join-Path $projectDir 'README.md') -Destination (Join-Path $projectDir 'dist\Shiguang\README.md')
+$packagedDocs = Join-Path $projectDir 'dist\Shiguang\docs'
+New-Item -ItemType Directory -Force -Path $packagedDocs | Out-Null
+Copy-Item -LiteralPath (Join-Path $projectDir 'docs\version-and-sharing.md'), (Join-Path $projectDir 'docs\v2-design.md') -Destination $packagedDocs
 & (Join-Path $PSScriptRoot 'check_package.ps1')
+$version = & $pythonExe -c 'from ins_saver import __version__; print(__version__)'
+$releaseDir = Join-Path $projectDir 'releases'
+New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+$releaseArchive = Join-Path $releaseDir "Shiguang-v$version-windows-x64.zip"
+$zipCode = @'
+from pathlib import Path
+from zipfile import ZipFile, ZIP_DEFLATED
+import sys
+source, target = Path(sys.argv[1]), Path(sys.argv[2])
+temporary = target.with_suffix('.zip.part')
+try:
+    with ZipFile(temporary, 'w', ZIP_DEFLATED, compresslevel=6) as archive:
+        for item in sorted(source.rglob('*')):
+            if item.is_file():
+                archive.write(item, item.relative_to(source.parent).as_posix())
+    temporary.replace(target)
+finally:
+    temporary.unlink(missing_ok=True)
+'@
+$zipCode | & $pythonExe - (Join-Path $projectDir 'dist\Shiguang') $releaseArchive
+if ($LASTEXITCODE -ne 0) { throw 'Release archive creation failed.' }
 Write-Host 'Ready: dist\Shiguang\Shiguang.exe. Keep the complete Shiguang folder together.'
+Write-Host "Portable ZIP: $releaseArchive"

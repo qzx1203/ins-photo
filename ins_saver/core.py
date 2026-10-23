@@ -1,9 +1,10 @@
-"""Instagram post resolution and lossless, cancellable photo downloads."""
+"""Instagram post resolution, previews and lossless media downloads."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from io import BytesIO
 import os
 from pathlib import Path
 import re
@@ -34,12 +35,20 @@ class Photo:
 
 
 @dataclass
+class Video:
+    index: int
+    url: str
+    thumbnail_url: str
+
+
+@dataclass
 class PostInfo:
     shortcode: str
     author: str
     date: datetime
     photos: list[Photo]
     skipped_videos: int = 0
+    videos: list[Video] = field(default_factory=list)
 
 
 @dataclass
@@ -55,6 +64,7 @@ _IMAGE_EXTENSIONS = {
     "AVIF": ".avif", "GIF": ".gif", "TIFF": ".tiff", "HEIF": ".heic",
 }
 _IMAGE_ERRORS = (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError)
+_PREVIEW_LIMIT = 20 * 1024 * 1024
 
 
 def parse_post_url(text: str) -> str:
@@ -181,19 +191,19 @@ class InstagramClient:
             post = instaloader.Post.from_shortcode(self.loader.context, shortcode)
             _check_cancel(cancel)
             photos: list[Photo] = []
-            skipped_videos = 0
+            videos: list[Video] = []
             if post.typename == "GraphSidecar":
                 for index, node in enumerate(post.get_sidecar_nodes(), 1):
                     _check_cancel(cancel)
                     if node.is_video:
-                        skipped_videos += 1
+                        videos.append(Video(index, node.video_url, node.display_url))
                     else:
                         photos.append(Photo(index, node.display_url))
             elif post.is_video:
-                skipped_videos = 1
+                videos.append(Video(1, post.video_url, post.url))
             else:
                 photos.append(Photo(1, post.url))
-            info = PostInfo(shortcode, post.owner_username, post.date_utc, photos, skipped_videos)
+            info = PostInfo(shortcode, post.owner_username, post.date_utc, photos, len(videos), videos)
             _check_cancel(cancel)
             return info
         except Exception as exc:
@@ -218,6 +228,93 @@ def _image_extension(path: Path) -> str:
     return extension
 
 
+def _video_extension(path: Path) -> str:
+    """Reject incomplete ISO-BMFF containers without changing their bytes."""
+    size = path.stat().st_size
+    found: set[bytes] = set()
+    with path.open("rb") as source:
+        offset = 0
+        while offset < size:
+            source.seek(offset)
+            header = source.read(8)
+            if len(header) != 8:
+                raise ValueError("Incomplete MP4 box header")
+            box_size, kind = int.from_bytes(header[:4], "big"), header[4:]
+            header_size = 8
+            if box_size == 1:
+                extended = source.read(8)
+                if len(extended) != 8:
+                    raise ValueError("Incomplete extended MP4 box header")
+                box_size, header_size = int.from_bytes(extended, "big"), 16
+            elif box_size == 0:
+                box_size = size - offset
+            if box_size < header_size or offset + box_size > size:
+                raise ValueError("Incomplete MP4 box")
+            if offset == 0 and kind != b"ftyp":
+                raise ValueError("Missing MP4 file type")
+            payload_size = box_size - header_size
+            if kind == b"ftyp" and (payload_size < 8 or payload_size % 4):
+                raise ValueError("Invalid MP4 file type")
+            if kind in {b"moov", b"mdat"} and payload_size == 0:
+                raise ValueError("Empty MP4 media box")
+            found.add(kind)
+            offset += box_size
+    if not {b"ftyp", b"moov", b"mdat"} <= found:
+        raise ValueError("Missing MP4 media boxes")
+    return ".mp4"
+
+
+def fetch_preview(url: str, cancel: Event | None = None) -> bytes:
+    """Fetch and resize one photo or video cover in memory; never save a file."""
+    cancel = cancel if cancel is not None else Event()
+    session = requests.Session()
+    try:
+        _check_cancel(cancel)
+        content = BytesIO()
+        with session.get(url, stream=True, timeout=20, headers={"Accept-Encoding": "identity"}) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type and not (content_type.startswith("image/") or content_type == "application/octet-stream"):
+                raise AppError("预览内容不是图片，请重新读取帖文后重试。")
+            content_length = response.headers.get("Content-Length")
+            if content_length and not response.headers.get("Content-Encoding"):
+                try:
+                    expected_bytes = int(content_length)
+                except ValueError as exc:
+                    raise AppError("服务器返回了无效的预览图片长度，请稍后重试。") from exc
+                if expected_bytes > _PREVIEW_LIMIT:
+                    raise AppError("预览图片超过 20 MB，无法显示。")
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                _check_cancel(cancel)
+                if content.tell() + len(chunk) > _PREVIEW_LIMIT:
+                    raise AppError("预览图片超过 20 MB，无法显示。")
+                content.write(chunk)
+            if content_length and not response.headers.get("Content-Encoding") and content.tell() != expected_bytes:
+                raise AppError("预览图片下载不完整，请重新读取帖文后重试。")
+        _check_cancel(cancel)
+        try:
+            with Image.open(content) as picture:
+                picture.verify()
+            content.seek(0)
+            with Image.open(content) as picture:
+                picture.draft("RGB", (1280, 1280))
+                picture.thumbnail((1280, 1280))
+                picture.load()
+                _check_cancel(cancel)
+                preview = picture.convert("RGBA" if "A" in picture.getbands() else "RGB")
+                output = BytesIO()
+                preview.save(output, format="PNG")
+        except _IMAGE_ERRORS as exc:
+            raise AppError("无法显示预览，服务器未返回完整、有效的图片。") from exc
+        _check_cancel(cancel)
+        return output.getvalue()
+    except requests.exceptions.RequestException as exc:
+        _check_cancel(cancel)
+        raise _friendly_error(exc) from exc
+    finally:
+        session.close()
+
+
 class DownloadService:
     def __init__(self, client: InstagramClient | None = None):
         self.client = client
@@ -227,6 +324,7 @@ class DownloadService:
         self, url: str, destination: Path, cookies: dict[str, str] | None = None,
         cancel: Event | None = None,
         on_progress: Callable[[int, int, str], None] | None = None,
+        include_videos: bool = False,
     ) -> DownloadResult:
         cancel = cancel if cancel is not None else Event()
         progress = on_progress or (lambda done, total, message: None)
@@ -240,28 +338,7 @@ class DownloadService:
                 owns_client = True
             progress(0, 0, "正在读取帖文…")
             post = client.resolve(shortcode, cancel)
-            _check_cancel(cancel)
-            if not post.photos:
-                raise AppError("该帖文没有可下载的照片（视频和视频封面会自动跳过）。")
-            author = re.sub(r"[^A-Za-z0-9_.-]", "_", post.author).strip(". ") or "instagram"
-            directory = Path(destination).expanduser().resolve() / f"{author}_{shortcode}"
-            directory.mkdir(parents=True, exist_ok=True)
-            result = DownloadResult(directory, [], [])
-            total = len(post.photos)
-            progress(0, total, f"找到 {total} 张照片，跳过 {post.skipped_videos} 个视频。")
-            for position, photo in enumerate(post.photos):
-                _check_cancel(cancel)
-                stem = f"{shortcode}_{photo.index:02d}"
-                existing = self._find_existing(directory, stem)
-                if existing is not None:
-                    result.skipped.append(existing)
-                    progress(position + 1, total, f"已跳过已有图片：{existing.name}")
-                    continue
-                progress(position, total, f"正在下载第 {position + 1} / {total} 张照片…")
-                saved = self._download(photo.url, directory, stem, cancel)
-                result.saved.append(saved)
-                progress(position + 1, total, f"已保存：{saved.name}")
-            return result
+            return self._save_post(post, destination, include_videos, cancel, progress)
         except OSError as exc:
             raise AppError("无法写入下载文件夹，请检查路径、磁盘空间和写入权限。") from exc
         finally:
@@ -269,31 +346,86 @@ class DownloadService:
                 client.close()
             self.session.close()
 
+    def save_post(
+        self, post: PostInfo, destination: Path, *, include_videos: bool = False,
+        cancel: Event | None = None,
+        on_progress: Callable[[int, int, str], None] | None = None,
+    ) -> DownloadResult:
+        """Download a previously resolved post without querying Instagram again."""
+        cancel = cancel if cancel is not None else Event()
+        progress = on_progress or (lambda done, total, message: None)
+        try:
+            return self._save_post(post, destination, include_videos, cancel, progress)
+        except OSError as exc:
+            raise AppError("无法写入下载文件夹，请检查路径、磁盘空间和写入权限。") from exc
+        finally:
+            self.session.close()
+
+    def _save_post(
+        self, post: PostInfo, destination: Path, include_videos: bool,
+        cancel: Event, progress: Callable[[int, int, str], None],
+    ) -> DownloadResult:
+        _check_cancel(cancel)
+        media: list[Photo | Video] = list(post.photos)
+        if include_videos:
+            media.extend(post.videos)
+        media.sort(key=lambda item: item.index)
+        if not media:
+            raise AppError("该帖文没有可下载的照片；如需保存视频，请勾选“同时下载视频”后重试。")
+        shortcode = parse_post_url(f"https://www.instagram.com/p/{post.shortcode}/")
+        author = re.sub(r"[^A-Za-z0-9_.-]", "_", post.author).strip(". ") or "instagram"
+        directory = Path(destination).expanduser().resolve() / f"{author}_{shortcode}"
+        directory.mkdir(parents=True, exist_ok=True)
+        result = DownloadResult(directory, [], [])
+        total = len(media)
+        message = f"找到 {len(post.photos)} 张照片，"
+        message += f"{len(post.videos)} 个视频。" if include_videos else f"跳过 {post.skipped_videos} 个视频。"
+        progress(0, total, message)
+        for position, item in enumerate(media):
+            _check_cancel(cancel)
+            video = isinstance(item, Video)
+            stem = f"{shortcode}_{item.index:02d}"
+            existing = self._find_existing(directory, stem, video)
+            if existing is not None:
+                result.skipped.append(existing)
+                progress(position + 1, total, f"已跳过已有{'视频' if video else '图片'}：{existing.name}")
+                continue
+            progress(position, total, f"正在下载第 {position + 1} / {total} 个文件…")
+            saved = self._download(item.url, directory, stem, cancel, video)
+            result.saved.append(saved)
+            progress(position + 1, total, f"已保存：{saved.name}")
+        return result
+
     @staticmethod
-    def _find_existing(directory: Path, stem: str) -> Path | None:
+    def _find_existing(directory: Path, stem: str, video: bool = False) -> Path | None:
         for candidate in sorted(directory.glob(stem + ".*")):
-            if candidate.suffix.lower() not in {*_IMAGE_EXTENSIONS.values(), ".jpeg"} or not candidate.is_file():
+            extensions = {".mp4"} if video else {*_IMAGE_EXTENSIONS.values(), ".jpeg"}
+            if candidate.suffix.lower() not in extensions or not candidate.is_file():
                 continue
             try:
-                _image_extension(candidate)
+                (_video_extension if video else _image_extension)(candidate)
                 return candidate
             except _IMAGE_ERRORS:
                 continue
         return None
 
-    def _download(self, url: str, directory: Path, stem: str, cancel: Event) -> Path:
+    def _download(self, url: str, directory: Path, stem: str, cancel: Event, video: bool = False) -> Path:
         temporary: Path | None = None
+        label = "视频" if video else "图片"
         try:
             _check_cancel(cancel)
             with self.session.get(url, stream=True, timeout=20, headers={"Accept-Encoding": "identity"}) as response:
                 if response.status_code == 429:
-                    raise AppError("图片下载请求过于频繁（429），请稍后手动重试。")
+                    raise AppError(f"{label}下载请求过于频繁（429），请稍后手动重试。")
                 if response.status_code in {401, 403}:
-                    raise AppError("图片链接已过期或当前账号无权访问，请重新读取帖文后重试。")
+                    raise AppError(f"{label}链接已过期或当前账号无权访问，请重新读取帖文后重试。")
                 response.raise_for_status()
                 content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-                if content_type and not (content_type.startswith("image/") or content_type == "application/octet-stream"):
-                    raise AppError("服务器返回的内容不是图片，请重新读取帖文后重试。")
+                valid_type = content_type in {"video/mp4", "application/mp4", "application/octet-stream"} if video else (
+                    content_type.startswith("image/") or content_type == "application/octet-stream"
+                )
+                if content_type and not valid_type:
+                    raise AppError(f"服务器返回的内容不是{label}，请重新读取帖文后重试。")
                 byte_count = 0
                 with tempfile.NamedTemporaryFile(dir=directory, prefix=f".{stem}_", suffix=".part", delete=False) as output:
                     temporary = Path(output.name)
@@ -308,13 +440,13 @@ class DownloadService:
                     try:
                         expected_bytes = int(content_length)
                     except ValueError as exc:
-                        raise AppError("服务器返回了无效的图片长度，请稍后重试。") from exc
+                        raise AppError(f"服务器返回了无效的{label}长度，请稍后重试。") from exc
                     if byte_count != expected_bytes:
-                        raise AppError("图片下载不完整，请检查网络后手动重试。")
+                        raise AppError(f"{label}下载不完整，请检查网络后手动重试。")
             try:
-                extension = _image_extension(temporary)
+                extension = (_video_extension if video else _image_extension)(temporary)
             except _IMAGE_ERRORS as exc:
-                raise AppError("下载内容不是完整、有效的图片，请重新读取帖文后重试。") from exc
+                raise AppError(f"下载内容不是完整、有效的{label}，请重新读取帖文后重试。") from exc
             _check_cancel(cancel)
             target = directory / (stem + extension)
             # Windows rename is atomic, refuses overwrite, and works on removable FAT/exFAT disks.

@@ -88,12 +88,12 @@ def fake_loader(monkeypatch, post, username=None, error=None):
     monkeypatch.setattr(core.instaloader.Post, "from_shortcode", resolve)
 
 
-def test_resolve_carousel_preserves_order_and_skips_video_thumbnails(monkeypatch):
+def test_resolve_carousel_preserves_media_order_and_video_covers(monkeypatch):
     post = SimpleNamespace(
         typename="GraphSidecar", owner_username="artist", date_utc=datetime(2026, 1, 1),
         get_sidecar_nodes=lambda: iter([
             SimpleNamespace(is_video=False, display_url="https://cdn.test/first"),
-            SimpleNamespace(is_video=True, display_url="https://cdn.test/video-thumbnail"),
+            SimpleNamespace(is_video=True, video_url="https://cdn.test/video", display_url="https://cdn.test/video-thumbnail"),
             SimpleNamespace(is_video=False, display_url="https://cdn.test/third"),
         ]),
     )
@@ -102,6 +102,7 @@ def test_resolve_carousel_preserves_order_and_skips_video_thumbnails(monkeypatch
     result = client.resolve("test123", Event())
     assert result.photos == [core.Photo(1, "https://cdn.test/first"), core.Photo(3, "https://cdn.test/third")]
     assert result.skipped_videos == 1
+    assert result.videos == [core.Video(2, "https://cdn.test/video", "https://cdn.test/video-thumbnail")]
     assert result.author == "artist"
     client.close()
     assert client.loader.closed
@@ -114,12 +115,14 @@ def test_resolve_carousel_preserves_order_and_skips_video_thumbnails(monkeypatch
 def test_resolve_single_media(monkeypatch, is_video, expected_photos, skipped):
     post = SimpleNamespace(
         typename="GraphVideo" if is_video else "GraphImage", is_video=is_video,
-        url="https://cdn.test/picture", owner_username="artist", date_utc=datetime(2026, 1, 1),
+        url="https://cdn.test/picture", video_url="https://cdn.test/video",
+        owner_username="artist", date_utc=datetime(2026, 1, 1),
     )
     fake_loader(monkeypatch, post)
     result = core.InstagramClient().resolve("test123", Event())
     assert result.photos == expected_photos
     assert result.skipped_videos == skipped
+    assert result.videos == ([core.Video(1, "https://cdn.test/video", "https://cdn.test/picture")] if is_video else [])
 
 
 def test_cookie_login_must_be_verified(monkeypatch):
